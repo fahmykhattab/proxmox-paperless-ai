@@ -817,6 +817,79 @@ else
     ok "Updated docker-compose.yaml with API token"
 fi
 
+
+# ─── Create Tags & Workflow ───────────────────────────────────────────────────
+if [ -n "$API_TOKEN" ]; then
+    info "Setting up AI processing tags and workflow..."
+    API_URL="http://localhost:8000/api"
+    AUTH_HEADER="Authorization: Token ${API_TOKEN}"
+
+    # Create the 4 paperless-gpt tags
+    TAG_IDS=()
+    for tag_name in "paperless-gpt" "paperless-gpt-auto" "paperless-gpt-ocr-auto" "paperless-gpt-ocr-complete"; do
+        RESULT=$(curl -sS -X POST "${API_URL}/tags/" \
+            -H "$AUTH_HEADER" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"${tag_name}\", \"matching_algorithm\": 1, \"is_insensitive\": true}" 2>/dev/null)
+        TAG_ID=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)
+        if [ -n "$TAG_ID" ]; then
+            ok "Created tag: ${tag_name} (id: ${TAG_ID})"
+            TAG_IDS+=("$TAG_ID")
+        else
+            # Tag may already exist — try to find it
+            TAG_ID=$(curl -sS "${API_URL}/tags/?name__iexact=${tag_name}" \
+                -H "$AUTH_HEADER" 2>/dev/null | \
+                python3 -c "import sys,json; r=json.load(sys.stdin)['results']; print(r[0]['id'] if r else '')" 2>/dev/null || true)
+            if [ -n "$TAG_ID" ]; then
+                info "Tag already exists: ${tag_name} (id: ${TAG_ID})"
+                TAG_IDS+=("$TAG_ID")
+            else
+                warn "Could not create/find tag: ${tag_name}"
+            fi
+        fi
+    done
+
+    # Get the IDs for auto and ocr-auto tags (index 1 and 2)
+    AUTO_TAG_ID="${TAG_IDS[1]:-}"
+    OCR_AUTO_TAG_ID="${TAG_IDS[2]:-}"
+
+    # Create workflow: auto-assign paperless-gpt-auto + paperless-gpt-ocr-auto on consumption
+    if [ -n "$AUTO_TAG_ID" ] && [ -n "$OCR_AUTO_TAG_ID" ]; then
+        WORKFLOW_RESULT=$(curl -sS -X POST "${API_URL}/workflows/" \
+            -H "$AUTH_HEADER" \
+            -H "Content-Type: application/json" \
+            -d "{
+                \"name\": \"Auto AI Processing\",
+                \"order\": 0,
+                \"enabled\": true,
+                \"triggers\": [{
+                    \"type\": 1,
+                    \"sources\": [],
+                    \"filter_has_tags\": [],
+                    \"filter_has_not_tags\": [],
+                    \"matching_algorithm\": 0,
+                    \"match\": \"\",
+                    \"is_insensitive\": true
+                }],
+                \"actions\": [{
+                    \"type\": 1,
+                    \"assign_tags\": [${AUTO_TAG_ID}, ${OCR_AUTO_TAG_ID}]
+                }]
+            }" 2>/dev/null)
+        WF_ID=$(echo "$WORKFLOW_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || true)
+        if [ -n "$WF_ID" ]; then
+            ok "Created workflow: Auto AI Processing (id: ${WF_ID})"
+            ok "Every new document will auto-trigger AI OCR and tagging"
+        else
+            warn "Could not create workflow — you can set it up manually in the web UI"
+        fi
+    else
+        warn "Skipping workflow creation — tag IDs not available"
+    fi
+else
+    warn "Skipping tag/workflow setup — no API token available"
+fi
+
 # ─── Start remaining services ─────────────────────────────────────────────────
 info "Starting Paperless-GPT and Paperless-AI..."
 $COMPOSE_CMD up -d
