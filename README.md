@@ -1,12 +1,31 @@
 # Proxmox Paperless AI
 
-One-liner installer for a full AI-powered document management stack on Proxmox VE (or any Docker host).
+One-liner installer for a full AI-powered document management stack.
 
 ## Quick Start
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/fahmykhattab/proxmox-paperless-ai/main/paperless-ai-stack.sh)"
 ```
+
+## Install Modes
+
+The script auto-detects your environment:
+
+### 🖥️ Proxmox VE Host
+Creates a dedicated **LXC container** with Docker, then deploys the full stack inside it. Clean separation from your hypervisor.
+
+- Auto-creates privileged LXC with Docker support
+- Configurable CT ID, hostname, CPU, RAM, disk, network
+- Downloads Debian 12 template if needed
+- Installs Docker inside the LXC automatically
+- Detects PVE host Ollama for AI integration
+
+### 🐧 Standalone (Any Linux)
+Runs directly on any machine with Docker — bare metal, VM, existing LXC, VPS.
+
+- Works on Debian, Ubuntu, or any Docker-capable distro
+- Auto-detects Docker and Docker Compose
 
 ## What It Deploys
 
@@ -33,32 +52,46 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/fahmykhattab/proxmox-pap
 
 ## Requirements
 
+**Proxmox mode:**
+- Proxmox VE 7+ with a Debian/Ubuntu template available
+
+**Standalone mode:**
 - Docker & Docker Compose v2+
-- (Optional) [Ollama](https://ollama.ai) for local AI inference
 
-## How It Works
+**Optional:**
+- [Ollama](https://ollama.ai) for local AI inference
+
+## Architecture
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌─────────────┐
-│  Upload PDF  │────▶│ Paperless-ngx │────▶│   Postgres  │
-│  or Image    │     │   (OCR)       │     │  (Storage)  │
-└─────────────┘     └──────┬───────┘     └─────────────┘
-                           │
-                    ┌──────▼───────┐
-                    │ Paperless-GPT │──── Ollama (LLM)
-                    │ (AI Tagging)  │
-                    └──────┬───────┘
-                           │
-                    ┌──────▼───────┐
-                    │ Paperless-AI  │──── Ollama (LLM)
-                    │ (Classify+RAG)│
-                    └──────────────┘
+┌─────────────────────────────────────────────────────────┐
+│  Proxmox VE Host                                        │
+│                                                         │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  LXC Container (paperless)                       │   │
+│  │                                                  │   │
+│  │  ┌─────────────┐  ┌──────────────┐              │   │
+│  │  │  Upload PDF  │──│ Paperless-ngx │──┐          │   │
+│  │  │  or Image    │  │   (OCR)       │  │          │   │
+│  │  └─────────────┘  └──────────────┘  │          │   │
+│  │                                      ▼          │   │
+│  │                   ┌──────────────┐ ┌─────────┐  │   │
+│  │                   │ Paperless-GPT │ │Postgres │  │   │
+│  │                   │ (AI Tagging)  │ │  Redis  │  │   │
+│  │                   └──────┬───────┘ └─────────┘  │   │
+│  │                          │                       │   │
+│  │                   ┌──────▼───────┐              │   │
+│  │                   │ Paperless-AI  │              │   │
+│  │                   │(Classify+RAG) │              │   │
+│  │                   └──────────────┘              │   │
+│  └──────────────────────┬───────────────────────────┘   │
+│                         │                               │
+│  ┌──────────────────────▼──────────────────────────┐   │
+│  │  Ollama (host)         :11434                    │   │
+│  │  qwen3, llama3, etc.                             │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
 ```
-
-1. **Upload** a document to Paperless-ngx (web UI or `consume/` folder)
-2. **Paperless-ngx** performs OCR (Tesseract) and stores the document
-3. **Paperless-GPT** enhances OCR with vision LLM and auto-tags documents
-4. **Paperless-AI** classifies documents and enables RAG chat
 
 ## Post-Install
 
@@ -86,6 +119,10 @@ Full list: [Tesseract languages](https://tesseract-ocr.github.io/tessdoc/Data-Fi
 ### Management Commands
 
 ```bash
+# If installed in LXC, enter it first:
+pct enter <CT_ID>
+
+# Then manage the stack:
 cd /opt/paperless
 docker compose logs -f          # View logs
 docker compose restart           # Restart all

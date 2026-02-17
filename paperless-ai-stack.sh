@@ -4,7 +4,16 @@
 # =============================================================================
 # Deploy a full AI-powered document management stack with Docker Compose.
 #
-# Usage:
+# Two modes:
+#   1. PROXMOX MODE — Run on PVE host: creates a dedicated LXC, installs
+#      Docker inside it, and deploys the full stack automatically.
+#   2. STANDALONE MODE — Run on any Linux machine with Docker already
+#      installed (bare metal, VM, existing LXC, VPS, etc.)
+#
+# Usage (Proxmox host):
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/fahmykhattab/proxmox-paperless-ai/main/paperless-ai-stack.sh)"
+#
+# Usage (any machine with Docker):
 #   bash -c "$(curl -fsSL https://raw.githubusercontent.com/fahmykhattab/proxmox-paperless-ai/main/paperless-ai-stack.sh)"
 #
 # What it deploys:
@@ -15,8 +24,9 @@
 #   - Redis 7          (Message Broker)
 #
 # Requirements:
-#   - Docker & Docker Compose v2+
-#   - (Optional) Ollama for local LLM inference
+#   Proxmox mode: Proxmox VE 7+ with a Debian/Ubuntu template
+#   Standalone:   Docker & Docker Compose v2+
+#   Optional:     Ollama for local LLM inference
 #
 # Author: Dr. Fahmy Khattab / Kemo AI
 # License: MIT
@@ -54,11 +64,275 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ─── Pre-flight Checks ───────────────────────────────────────────────────────
+# ─── Detect Environment ──────────────────────────────────────────────────────
 header "Paperless AI Stack Installer"
 echo -e "  ${BOLD}Paperless-ngx${NC} + ${BOLD}Paperless-GPT${NC} + ${BOLD}Paperless-AI${NC}"
 echo -e "  AI-powered Document Management System"
 echo ""
+
+IS_PROXMOX=false
+if command -v pveversion &>/dev/null; then
+    IS_PROXMOX=true
+    PVE_VERSION=$(pveversion --verbose 2>/dev/null | grep "^pve-manager" | awk '{print $2}' || pveversion 2>/dev/null)
+    ok "Proxmox VE detected: ${PVE_VERSION}"
+    echo ""
+    echo -e "  ${BOLD}1)${NC} Create a new LXC container (recommended)"
+    echo -e "  ${BOLD}2)${NC} Install directly on this host"
+    echo ""
+    prompt_var INSTALL_MODE "Install mode" "1"
+else
+    INSTALL_MODE="2"
+fi
+
+# =============================================================================
+# PROXMOX LXC MODE
+# =============================================================================
+if [ "$INSTALL_MODE" = "1" ] && [ "$IS_PROXMOX" = true ]; then
+    header "LXC Container Setup"
+
+    # ─── Find next available CT ID ────────────────────────────────────────
+    NEXT_ID=$(pvesh get /cluster/nextid 2>/dev/null || echo "200")
+    prompt_var CT_ID "Container ID" "$NEXT_ID"
+
+    # Check if ID is already in use
+    if pct status "$CT_ID" &>/dev/null; then
+        err "CT $CT_ID already exists!"
+        exit 1
+    fi
+
+    prompt_var CT_HOSTNAME "Hostname" "paperless"
+
+    # ─── Resources ────────────────────────────────────────────────────────
+    prompt_var CT_CORES "CPU cores" "2"
+    prompt_var CT_MEMORY "Memory (MB)" "4096"
+    prompt_var CT_DISK "Disk size (GB)" "20"
+    prompt_var CT_SWAP "Swap (MB)" "512"
+
+    # ─── Storage ──────────────────────────────────────────────────────────
+    STORAGES=$(pvesm status --content rootdir 2>/dev/null | awk 'NR>1 {print $1}' | tr '\n' ' ')
+    if [ -z "$STORAGES" ]; then
+        STORAGES="local"
+    fi
+    info "Available storage: ${STORAGES}"
+    prompt_var CT_STORAGE "Storage for rootfs" "local"
+
+    # ─── Template ─────────────────────────────────────────────────────────
+    info "Available templates:"
+    TEMPLATES=$(pveam list "$CT_STORAGE" 2>/dev/null | awk 'NR>1 {print $1}')
+    if [ -z "$TEMPLATES" ]; then
+        info "No templates found. Downloading Debian 12..."
+        pveam download "$CT_STORAGE" debian-12-standard_12.12-1_amd64.tar.zst 2>/dev/null || \
+        pveam download "$CT_STORAGE" debian-12-standard_12.7-1_amd64.tar.zst 2>/dev/null || {
+            err "Failed to download template. Please download manually:"
+            info "  pveam update && pveam download $CT_STORAGE debian-12-standard_12.12-1_amd64.tar.zst"
+            exit 1
+        }
+        TEMPLATES=$(pveam list "$CT_STORAGE" 2>/dev/null | awk 'NR>1 {print $1}')
+    fi
+
+    # Default to latest Debian 12
+    DEFAULT_TPL=$(echo "$TEMPLATES" | grep -i "debian-12" | sort -V | tail -1)
+    [ -z "$DEFAULT_TPL" ] && DEFAULT_TPL=$(echo "$TEMPLATES" | head -1)
+
+    echo "$TEMPLATES" | while read -r t; do echo "    - $t"; done
+    echo ""
+    prompt_var CT_TEMPLATE "Template" "$DEFAULT_TPL"
+
+    # ─── Network ──────────────────────────────────────────────────────────
+    BRIDGES=$(ip link show type bridge 2>/dev/null | grep -oP '^\d+: \K[^:]+' || echo "vmbr0")
+    DEFAULT_BRIDGE=$(echo "$BRIDGES" | head -1)
+    prompt_var CT_BRIDGE "Network bridge" "$DEFAULT_BRIDGE"
+    prompt_var CT_IP "IP config (dhcp or IP/CIDR)" "dhcp"
+
+    if [ "$CT_IP" != "dhcp" ]; then
+        # Need gateway for static IP
+        DEFAULT_GW=$(ip route | grep default | awk '{print $3}' | head -1)
+        prompt_var CT_GW "Gateway" "$DEFAULT_GW"
+        NET_CONFIG="name=eth0,bridge=${CT_BRIDGE},ip=${CT_IP},gw=${CT_GW}"
+    else
+        NET_CONFIG="name=eth0,bridge=${CT_BRIDGE},ip=dhcp"
+    fi
+
+    # ─── Password ─────────────────────────────────────────────────────────
+    CT_PASS=$(head /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 16)
+    info "Generated root password: ${CT_PASS}"
+    info "(saved to credentials file after install)"
+
+    # ─── Summary ──────────────────────────────────────────────────────────
+    header "LXC Summary"
+    echo -e "  ${BOLD}CT ID:${NC}       $CT_ID"
+    echo -e "  ${BOLD}Hostname:${NC}    $CT_HOSTNAME"
+    echo -e "  ${BOLD}Template:${NC}    $CT_TEMPLATE"
+    echo -e "  ${BOLD}CPU:${NC}         $CT_CORES cores"
+    echo -e "  ${BOLD}Memory:${NC}      ${CT_MEMORY}MB + ${CT_SWAP}MB swap"
+    echo -e "  ${BOLD}Disk:${NC}        ${CT_DISK}GB on ${CT_STORAGE}"
+    echo -e "  ${BOLD}Network:${NC}     $NET_CONFIG"
+    echo ""
+
+    read -rp "$(echo -e "${CYAN}?${NC}  Create LXC and install Paperless AI Stack? [Y/n]: ")" CONFIRM
+    if [[ "${CONFIRM,,}" =~ ^(n|no)$ ]]; then
+        warn "Installation cancelled."
+        exit 0
+    fi
+
+    # ─── Create LXC ──────────────────────────────────────────────────────
+    header "Creating LXC Container"
+    info "Creating CT ${CT_ID} (${CT_HOSTNAME})..."
+
+    pct create "$CT_ID" "$CT_TEMPLATE" \
+        --hostname "$CT_HOSTNAME" \
+        --cores "$CT_CORES" \
+        --memory "$CT_MEMORY" \
+        --swap "$CT_SWAP" \
+        --rootfs "${CT_STORAGE}:${CT_DISK}" \
+        --net0 "$NET_CONFIG" \
+        --ostype debian \
+        --password "$CT_PASS" \
+        --features nesting=1,keyctl=1 \
+        --onboot 1 \
+        --unprivileged 0 \
+        --start 0
+
+    ok "CT ${CT_ID} created"
+
+    # ─── Configure for Docker ─────────────────────────────────────────────
+    info "Configuring LXC for Docker support..."
+
+    # Add required LXC config for Docker-in-LXC
+    {
+        echo "lxc.apparmor.profile: unconfined"
+        echo "lxc.cgroup2.devices.allow: a"
+        echo "lxc.cap.drop: "
+        echo "lxc.mount.auto: proc:rw sys:rw"
+    } >> "/etc/pve/lxc/${CT_ID}.conf"
+
+    ok "Docker support configured"
+
+    # ─── Start LXC ────────────────────────────────────────────────────────
+    info "Starting CT ${CT_ID}..."
+    pct start "$CT_ID"
+    sleep 5
+
+    # Wait for network
+    info "Waiting for network..."
+    RETRIES=0
+    while [ $RETRIES -lt 30 ]; do
+        if pct exec "$CT_ID" -- ping -c1 -W2 8.8.8.8 &>/dev/null; then
+            break
+        fi
+        RETRIES=$((RETRIES + 1))
+        sleep 2
+    done
+
+    if [ $RETRIES -ge 30 ]; then
+        err "CT ${CT_ID} has no network connectivity"
+        exit 1
+    fi
+
+    # Get CT IP
+    CT_ACTUAL_IP=$(pct exec "$CT_ID" -- hostname -I 2>/dev/null | awk '{print $1}')
+    ok "CT ${CT_ID} is online at ${CT_ACTUAL_IP}"
+
+    # ─── Install Docker inside LXC ────────────────────────────────────────
+    header "Installing Docker in LXC"
+    info "Updating packages..."
+    pct exec "$CT_ID" -- bash -c "apt-get update -qq && apt-get install -y -qq curl ca-certificates gnupg >/dev/null 2>&1"
+    ok "Base packages installed"
+
+    info "Installing Docker (this takes 1-2 minutes)..."
+    pct exec "$CT_ID" -- bash -c "curl -fsSL https://get.docker.com | sh" >/dev/null 2>&1
+    pct exec "$CT_ID" -- systemctl enable --now docker >/dev/null 2>&1
+    ok "Docker installed"
+
+    # Verify Docker works
+    if pct exec "$CT_ID" -- docker run --rm hello-world &>/dev/null; then
+        ok "Docker is working inside CT ${CT_ID}"
+    else
+        warn "Docker test failed — containers may still work"
+    fi
+
+    # ─── Now run the Paperless install inside the LXC ─────────────────────
+    # We pass the configuration as environment variables and run the
+    # standalone installer part inside the container
+    header "Installing Paperless AI Stack in CT ${CT_ID}"
+
+    # Detect PVE host IP (for Ollama access from inside LXC)
+    PVE_HOST_IP=$(ip -4 addr show vmbr0 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1)
+    [ -z "$PVE_HOST_IP" ] && PVE_HOST_IP=$(hostname -I | awk '{print $1}')
+
+    # Download the script inside the LXC and run it
+    # We re-download to ensure it runs natively inside the container
+    info "Launching Paperless installer inside the container..."
+    info "The installer will ask you configuration questions now."
+    echo ""
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  Entering CT ${CT_ID} — configure the Paperless stack below${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    # Pass PVE host IP hint as environment variable
+    pct exec "$CT_ID" -- bash -c "
+        export PAPERLESS_PVE_HOST_IP='${PVE_HOST_IP}'
+        bash <(curl -fsSL https://raw.githubusercontent.com/fahmykhattab/proxmox-paperless-ai/main/paperless-ai-stack.sh)
+    "
+
+    STACK_EXIT=$?
+
+    echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  Back on Proxmox host${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
+    echo ""
+
+    if [ $STACK_EXIT -eq 0 ]; then
+        header "Proxmox LXC Installation Complete!"
+        echo ""
+        echo -e "  ${BOLD}${GREEN}🎉 Paperless AI Stack is running in CT ${CT_ID}!${NC}"
+        echo ""
+        echo -e "  ${BOLD}Container:${NC}"
+        echo -e "    CT ID:        ${CT_ID}"
+        echo -e "    Hostname:     ${CT_HOSTNAME}"
+        echo -e "    IP:           ${CT_ACTUAL_IP}"
+        echo -e "    Root pass:    ${CT_PASS}"
+        echo ""
+        echo -e "  ${BOLD}Access:${NC}"
+        echo -e "    📄 Paperless-ngx   → ${CYAN}http://${CT_ACTUAL_IP}:8000${NC}"
+        echo -e "    🤖 Paperless-GPT   → ${CYAN}http://${CT_ACTUAL_IP}:8081${NC}"
+        echo -e "    🧠 Paperless-AI    → ${CYAN}http://${CT_ACTUAL_IP}:3000${NC}"
+        echo ""
+        echo -e "  ${BOLD}Management:${NC}"
+        echo -e "    pct enter ${CT_ID}              # Enter container shell"
+        echo -e "    pct exec ${CT_ID} -- docker compose -f /opt/paperless/docker-compose.yaml logs -f"
+        echo ""
+
+        # Save LXC credentials
+        LXC_CREDS="/etc/pve/local/paperless-ct${CT_ID}.creds"
+        cat > "$LXC_CREDS" << LXCCREDSEOF
+# Paperless AI Stack — LXC ${CT_ID}
+# Generated: $(date -Iseconds)
+CT ID:        ${CT_ID}
+Hostname:     ${CT_HOSTNAME}
+IP:           ${CT_ACTUAL_IP}
+Root pass:    ${CT_PASS}
+Paperless:    http://${CT_ACTUAL_IP}:8000
+GPT:          http://${CT_ACTUAL_IP}:8081
+AI:           http://${CT_ACTUAL_IP}:3000
+LXCCREDSEOF
+        chmod 600 "$LXC_CREDS"
+        ok "LXC credentials saved to ${LXC_CREDS}"
+    else
+        err "Installation inside CT ${CT_ID} failed (exit code: ${STACK_EXIT})"
+        warn "Container is still running — you can debug with: pct enter ${CT_ID}"
+    fi
+
+    exit $STACK_EXIT
+fi
+
+# =============================================================================
+# STANDALONE MODE (any machine with Docker)
+# =============================================================================
+
+# ─── Pre-flight Checks ───────────────────────────────────────────────────────
 
 # Check root
 if [ "$(id -u)" -ne 0 ]; then
@@ -98,10 +372,12 @@ fi
 # Check curl (needed for health checks and Ollama detection)
 if ! command -v curl &>/dev/null; then
     info "Installing curl..."
-    apt-get update -qq && apt-get install -y -qq curl >/dev/null 2>&1 || {
+    if apt-get update -qq && apt-get install -y -qq curl >/dev/null 2>&1; then
+        ok "curl installed"
+    else
         err "curl is required but could not be installed"
         exit 1
-    }
+    fi
 fi
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -113,7 +389,7 @@ prompt_var INSTALL_DIR "Install directory" "/opt/paperless"
 # Check for existing installation
 if [ -f "$INSTALL_DIR/docker-compose.yaml" ]; then
     warn "Existing installation found at $INSTALL_DIR"
-    read -rp "$(echo -e "${CYAN}?${NC}  Overwrite? This will NOT delete your data. [y/N]: ")" OVERWRITE
+    read -rp "$(echo -e "${CYAN}?${NC}  Overwrite config? Data volumes are preserved. [y/N]: ")" OVERWRITE
     if [[ ! "${OVERWRITE,,}" =~ ^(y|yes)$ ]]; then
         warn "Installation cancelled."
         exit 0
@@ -128,7 +404,7 @@ prompt_var HOST_IP "Host IP address" "$DEFAULT_IP"
 # Admin credentials
 prompt_var ADMIN_USER "Paperless admin username" "admin"
 
-# Password prompt (don't echo default 'admin' without warning)
+# Password prompt
 echo -e "${YELLOW}⚠${NC}  Change the default password if this is not a test setup!"
 prompt_var ADMIN_PASS "Paperless admin password" "admin"
 
@@ -159,11 +435,21 @@ OLLAMA_DOCKER_URL=""
 LLM_MODEL=""
 VISION_MODEL=""
 LLM_LANGUAGE="English"
+OLLAMA_URL=""
 
 if [[ "${USE_OLLAMA,,}" =~ ^(y|yes)$ ]]; then
+    # Check for PVE host IP hint (set when running inside LXC from Proxmox mode)
+    PVE_HINT="${PAPERLESS_PVE_HOST_IP:-}"
+
     # Auto-detect Ollama
     OLLAMA_DETECTED=""
-    for candidate in "http://localhost:11434" "http://127.0.0.1:11434" "http://${HOST_IP}:11434"; do
+    CANDIDATES=("http://localhost:11434" "http://127.0.0.1:11434" "http://${HOST_IP}:11434")
+    # If we have a PVE host hint, try that too
+    if [ -n "$PVE_HINT" ] && [ "$PVE_HINT" != "$HOST_IP" ]; then
+        CANDIDATES+=("http://${PVE_HINT}:11434")
+    fi
+
+    for candidate in "${CANDIDATES[@]}"; do
         if curl -sS --max-time 3 "$candidate/api/tags" &>/dev/null; then
             OLLAMA_DETECTED="$candidate"
             break
@@ -174,13 +460,25 @@ if [[ "${USE_OLLAMA,,}" =~ ^(y|yes)$ ]]; then
         ok "Ollama detected at $OLLAMA_DETECTED"
         prompt_var OLLAMA_URL "Ollama URL" "$OLLAMA_DETECTED"
     else
+        DEFAULT_OLLAMA_URL="http://${PVE_HINT:-${HOST_IP}}:11434"
         warn "Ollama not detected on common ports"
-        prompt_var OLLAMA_URL "Ollama URL" "http://${HOST_IP}:11434"
+        info "If Ollama is on the Proxmox host, use the host IP"
+        prompt_var OLLAMA_URL "Ollama URL" "$DEFAULT_OLLAMA_URL"
     fi
 
-    # Docker gateway for containers to reach host
+    # Docker gateway for containers to reach host network
     DOCKER_GW=$(docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || echo "172.17.0.1")
-    OLLAMA_DOCKER_URL="http://${DOCKER_GW}:11434"
+
+    # Determine the Ollama URL for Docker containers
+    # If Ollama is on localhost/127.0.0.1, containers need the Docker gateway
+    OLLAMA_HOST_PART=$(echo "$OLLAMA_URL" | sed -E 's|https?://||;s|:[0-9]+$||')
+    if [ "$OLLAMA_HOST_PART" = "localhost" ] || [ "$OLLAMA_HOST_PART" = "127.0.0.1" ]; then
+        OLLAMA_DOCKER_URL="http://${DOCKER_GW}:11434"
+        info "Containers will reach Ollama via Docker gateway: $OLLAMA_DOCKER_URL"
+    else
+        # Ollama is on a remote/LAN IP, containers can use it directly
+        OLLAMA_DOCKER_URL="$OLLAMA_URL"
+    fi
 
     # List available models
     echo ""
@@ -430,7 +728,6 @@ cd "${INSTALL_DIR}"
 if $COMPOSE_CMD config --quiet 2>/dev/null; then
     ok "Docker Compose file is valid"
 else
-    # Try with less strict validation
     $COMPOSE_CMD config >/dev/null 2>&1 || {
         err "Docker Compose file has errors!"
         $COMPOSE_CMD config 2>&1 | tail -5
